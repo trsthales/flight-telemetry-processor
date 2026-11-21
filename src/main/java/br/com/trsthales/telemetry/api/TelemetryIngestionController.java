@@ -21,9 +21,7 @@ public class TelemetryIngestionController {
 
     @PostMapping
     public ResponseEntity<Void> receivePacket(@Valid @RequestBody TelemetryPacketRequest request) {
-        boolean updated = fastPathService.ingest(request.toVitalState());
-        return ResponseEntity.noContent()
-                .header("X-Vital-State-Updated", String.valueOf(updated))
-                .build();
+        fastPathService.ingest(request.toPacket());
+        return ResponseEntity.accepted().build();
     }
 }

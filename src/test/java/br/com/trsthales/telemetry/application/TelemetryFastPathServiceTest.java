@@ -1,8 +1,11 @@
 package br.com.trsthales.telemetry.application;
 
 import br.com.trsthales.telemetry.application.port.AircraftVitalStateRepository;
+import br.com.trsthales.telemetry.application.port.PacketIdempotencyStore;
+import br.com.trsthales.telemetry.application.port.TelemetryEventPublisher;
 import br.com.trsthales.telemetry.domain.AircraftVitalState;
 import br.com.trsthales.telemetry.domain.PacketTimestampOutOfRangeException;
+import br.com.trsthales.telemetry.domain.TelemetryPacket;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -13,14 +16,16 @@ import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -31,53 +36,82 @@ class TelemetryFastPathServiceTest {
     @Mock
     private AircraftVitalStateRepository repository;
 
+    @Mock
+    private PacketIdempotencyStore idempotencyStore;
+
+    @Mock
+    private TelemetryEventPublisher eventPublisher;
+
     private TelemetryFastPathService service;
 
     @BeforeEach
     void setUp() {
-        service = new TelemetryFastPathService(repository, Clock.fixed(FIXED_NOW, ZoneOffset.UTC));
+        service = new TelemetryFastPathService(
+                repository,
+                idempotencyStore,
+                eventPublisher,
+                Clock.fixed(FIXED_NOW, ZoneOffset.UTC)
+        );
     }
 
     @Test
-    void acceptsTimestampsAtExactDriftAndRetentionBoundaries() {
-        when(repository.saveIfNewer(any())).thenReturn(true);
+    void ingestsValidNewPacketIntoRedisAndKafka() {
+        TelemetryPacket packet = packetAt("pkt-01", FIXED_NOW);
+        when(idempotencyStore.tryAcquire("pkt-01")).thenReturn(true);
+        when(repository.saveIfNewer(packet.vitals())).thenReturn(true);
 
-        AircraftVitalState upperBound = stateAt(FIXED_NOW.plusSeconds(30));
-        AircraftVitalState lowerBound = stateAt(FIXED_NOW.minusSeconds(6 * 3600));
+        assertThat(service.ingest(packet)).isTrue();
 
-        assertThat(service.ingest(lowerBound)).isTrue();
-        assertThat(service.ingest(upperBound)).isTrue();
-        verify(repository, times(2)).saveIfNewer(any());
+        verify(repository).saveIfNewer(packet.vitals());
+        verify(eventPublisher).publish(packet);
+        verify(idempotencyStore, never()).release(any());
     }
 
     @Test
-    void rejectsFutureDriftAbove30Seconds() {
-        AircraftVitalState drifted = stateAt(FIXED_NOW.plusSeconds(31));
+    void ignoresDuplicatePacketWithoutTouchingStateOrKafka() {
+        TelemetryPacket duplicate = packetAt("pkt-dup", FIXED_NOW);
+        when(idempotencyStore.tryAcquire("pkt-dup")).thenReturn(false);
 
-        assertThatThrownBy(() -> service.ingest(drifted))
-                .isInstanceOf(PacketTimestampOutOfRangeException.class)
-                .hasMessageContaining("30s");
+        assertThat(service.ingest(duplicate)).isFalse();
 
-        verify(repository, never()).saveIfNewer(any());
+        verifyNoInteractions(repository, eventPublisher);
     }
 
     @Test
-    void rejectsPacketsOlderThanSixHours() {
-        AircraftVitalState expired = stateAt(FIXED_NOW.minusSeconds(6 * 3600 + 1));
+    void publishesOutOfOrderPacketToKafkaEvenWhenVitalStateIsNotUpdated() {
+        TelemetryPacket delayed = packetAt("pkt-delayed", FIXED_NOW.minusSeconds(120));
+        when(idempotencyStore.tryAcquire("pkt-delayed")).thenReturn(true);
+        when(repository.saveIfNewer(delayed.vitals())).thenReturn(false);
 
-        assertThatThrownBy(() -> service.ingest(expired))
+        assertThat(service.ingest(delayed)).isFalse();
+
+        verify(eventPublisher).publish(delayed);
+    }
+
+    @Test
+    void releasesIdempotencyKeyWhenKafkaPublishFails() {
+        TelemetryPacket packet = packetAt("pkt-fail", FIXED_NOW);
+        when(idempotencyStore.tryAcquire("pkt-fail")).thenReturn(true);
+        when(repository.saveIfNewer(packet.vitals())).thenReturn(true);
+        doThrow(new RuntimeException("broker down")).when(eventPublisher).publish(packet);
+
+        assertThatThrownBy(() -> service.ingest(packet))
+                .isInstanceOf(RuntimeException.class);
+
+        verify(idempotencyStore).release("pkt-fail");
+    }
+
+    @Test
+    void rejectsOutOfWindowTimestampsBeforeCheckingIdempotency() {
+        TelemetryPacket futurePacket = packetAt("pkt-future", FIXED_NOW.plusSeconds(31));
+        TelemetryPacket expiredPacket = packetAt("pkt-old", FIXED_NOW.minusSeconds(6 * 3600 + 1));
+
+        assertThatThrownBy(() -> service.ingest(futurePacket))
+                .isInstanceOf(PacketTimestampOutOfRangeException.class);
+        assertThatThrownBy(() -> service.ingest(expiredPacket))
                 .isInstanceOf(PacketTimestampOutOfRangeException.class);
 
-        verify(repository, never()).saveIfNewer(any());
-    }
-
-    @Test
-    void returnsFalseWhenRepositoryDiscardsStalePacket() {
-        AircraftVitalState packet = stateAt(FIXED_NOW);
-        when(repository.saveIfNewer(packet)).thenReturn(false);
-
-        assertThat(service.ingest(packet)).isFalse();
-        verify(repository).saveIfNewer(packet);
+        verifyNoInteractions(idempotencyStore, repository, eventPublisher);
     }
 
     @Test
@@ -88,8 +122,8 @@ class TelemetryFastPathServiceTest {
         verify(repository).findLatestByAircraftId("PR-XMA");
     }
 
-    private AircraftVitalState stateAt(Instant recordedAt) {
-        return AircraftVitalState.of(
+    private TelemetryPacket packetAt(String packetId, Instant recordedAt) {
+        AircraftVitalState vitals = AircraftVitalState.of(
                 "PR-XMA",
                 "AD4021",
                 recordedAt,
@@ -97,5 +131,6 @@ class TelemetryFastPathServiceTest {
                 new BigDecimal("4000.00"),
                 new BigDecimal("11.30")
         );
+        return new TelemetryPacket(packetId, vitals, Map.of("apuStatus", "OFF"));
     }
 }

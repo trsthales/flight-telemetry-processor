@@ -81,12 +81,12 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return problem;
     }
 
-    @ExceptionHandler(DataAccessException.class)
-    public ResponseEntity<ProblemDetail> handleDataAccessFailure(DataAccessException ex) {
-        log.error("Storage infrastructure failure on fast-path", ex);
+    @ExceptionHandler({DataAccessException.class, org.springframework.kafka.KafkaException.class})
+    public ResponseEntity<ProblemDetail> handleInfrastructureFailure(RuntimeException ex) {
+        log.error("Infrastructure failure on telemetry ingestion path", ex);
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(
                 HttpStatus.SERVICE_UNAVAILABLE,
-                "Telemetry state store temporarily unavailable"
+                "Telemetry ingestion pipeline temporarily unavailable"
         );
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .header(HttpHeaders.RETRY_AFTER, "5")
