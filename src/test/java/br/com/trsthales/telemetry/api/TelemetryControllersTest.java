@@ -7,9 +7,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
-import org.springframework.dao.QueryTimeoutException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.kafka.KafkaException;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -37,23 +37,26 @@ class TelemetryControllersTest {
     private TelemetryFastPathService fastPathService;
 
     @Test
-    void returns204AndUpdatedHeaderWhenPacketIsAccepted() throws Exception {
+    void returns202WhenPacketIsAccepted() throws Exception {
         when(fastPathService.ingest(any())).thenReturn(true);
 
         mockMvc.perform(post("/api/v1/telemetry")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
+                                  "packetId": "pkt-001",
                                   "aircraftId": "PR-XMA",
                                   "flightNumber": "AD4021",
                                   "recordedAt": "2026-11-21T16:30:00Z",
                                   "engineTempCelsius": 910.00,
                                   "fuelRemainingKg": 4300.00,
-                                  "cabinPressurePsi": 11.40
+                                  "cabinPressurePsi": 11.40,
+                                  "diagnostics": {
+                                    "apuStatus": "OFF"
+                                  }
                                 }
                                 """))
-                .andExpect(status().isNoContent())
-                .andExpect(header().string("X-Vital-State-Updated", "true"));
+                .andExpect(status().isAccepted());
     }
 
     @Test
@@ -62,6 +65,7 @@ class TelemetryControllersTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
+                                  "packetId": "",
                                   "aircraftId": "INVALID@@@ID",
                                   "flightNumber": "AD4021",
                                   "recordedAt": "2026-11-21T16:30:00Z",
@@ -71,6 +75,7 @@ class TelemetryControllersTest {
                                 }
                                 """))
                 .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors.packetId").exists())
                 .andExpect(jsonPath("$.errors.aircraftId").exists())
                 .andExpect(jsonPath("$.errors.engineTempCelsius").exists())
                 .andExpect(jsonPath("$.errors.fuelRemainingKg").exists());
@@ -96,6 +101,7 @@ class TelemetryControllersTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
+                                  "packetId": "pkt-2099",
                                   "aircraftId": "PR-XMA",
                                   "flightNumber": "AD4021",
                                   "recordedAt": "2099-01-01T00:00:00Z",
@@ -109,13 +115,14 @@ class TelemetryControllersTest {
     }
 
     @Test
-    void returns503WithRetryAfterWhenRedisIsUnavailable() throws Exception {
-        when(fastPathService.ingest(any())).thenThrow(new QueryTimeoutException("Redis command timed out"));
+    void returns503WithRetryAfterWhenKafkaOrRedisFails() throws Exception {
+        when(fastPathService.ingest(any())).thenThrow(new KafkaException("Broker unavailable"));
 
         mockMvc.perform(post("/api/v1/telemetry")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
+                                  "packetId": "pkt-002",
                                   "aircraftId": "PR-XMA",
                                   "flightNumber": "AD4021",
                                   "recordedAt": "2026-11-21T16:30:00Z",
@@ -145,7 +152,7 @@ class TelemetryControllersTest {
     }
 
     @Test
-    void returns404WhenAircraftIsNotFound() throws Exception {
+    void returns404ProblemDetailWhenAircraftIsNotFound() throws Exception {
         when(fastPathService.getLatestVitals("PR-ZZZ")).thenReturn(Optional.empty());
 
         mockMvc.perform(get("/api/v1/aircraft/PR-ZZZ/vitals"))
