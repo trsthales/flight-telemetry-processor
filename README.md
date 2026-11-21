@@ -17,7 +17,7 @@ O fluxo separa a leitura crítica da carga pesada de escrita:
 
 ## Stack
 
-- Java 21 (Virtual Threads) + Spring Boot 3
+- Java 21 (Virtual Threads) + Spring Boot 4
 - Redis 7 (cache de estado quente e chave de idempotência)
 - Apache Kafka em modo KRaft
 - PostgreSQL 16 + Flyway
